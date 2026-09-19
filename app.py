@@ -25,7 +25,7 @@ from qqzone_downloader import (
 )
 
 # ── 配置 ──
-VERSION = "2.3.2"
+VERSION = "2.3.3"
 
 # PyInstaller 打包兼容：frozen 时资源在临时目录，用户数据在 exe 所在目录
 if getattr(sys, 'frozen', False):
@@ -125,10 +125,14 @@ def load_manifest(album_dir: str) -> dict:
 
 
 def save_manifest(album_dir: str, manifest: dict):
-    """保存照片清单"""
-    path = os.path.join(album_dir, MANIFEST_FILE)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    """保存照片清单（自动创建目录，失败不影响主流程）"""
+    try:
+        os.makedirs(album_dir, exist_ok=True)
+        path = os.path.join(album_dir, MANIFEST_FILE)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  ⚠ 保存清单失败: {album_dir}: {e}")
 
 
 def get_photo_key(photo: dict) -> str:
@@ -427,7 +431,7 @@ def api_download_start():
             if not photos:
                 continue
 
-                        # 加载已下载清单，剔除已存在的
+            # 加载已下载清单，剔除已存在的
             manifest = load_manifest(adir)
             new_photos = []
             new_videos = []

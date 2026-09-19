@@ -91,7 +91,7 @@ python app.py
 | 后端 | Python 3 + Flask |
 | 前端 | Alpine.js + Lucide Icons |
 | 扫码登录 | Selenium + Chrome/Edge DevTools Protocol |
-| 相册 API | QZone `fcg_list_album_v3` / `fcg_list_photo_v2` / `cgi_floatview_photo_list_v2` |
+| 相册 API | QZone `fcg_list_album_v3` / `cgi_list_photo`（大相册分页）/ `cgi_floatview_photo_list_v2` |
 | 打包 | PyInstaller + GitHub Actions 自动构建 |
 
 ## 📁 目录结构

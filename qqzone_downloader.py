@@ -5,8 +5,8 @@ QQ 空间相册 · 图片与视频一键下载工具
 
 关键修复：
   相册列表 → fcg_list_album_v3（工作正常）
-  照片列表 → fcg_list_photo_v2 + albumid（全小写！）
-  原图下载 → origin_url 字段
+  照片列表 → cgi_list_photo + topicId + pageStart/pageNum（大相册不再截断于 2000）
+  原图下载 → origin_url / url 字段
 
 新功能：
   ✅ 选择性下载：1,3,5-8 或 a 全部
@@ -32,6 +32,37 @@ _PROGRESS_LOCK = Lock()
 # ═══════════════════════════════════════════════════════════════
 # 网络请求
 # ═══════════════════════════════════════════════════════════════
+
+def _parse_qzone_json(text: str) -> dict:
+    """
+    解析 QZone 返回的 JSON，兼容以下异常：
+      - 非法反斜杠转义 (Invalid \\escape)
+      - 多余尾随数据 (Extra data)
+      - 裸控制字符
+    先尝试原样解析，失败则修复非法转义后重试。
+    """
+    def _fix(s: str) -> str:
+        # 把非法的反斜杠转义 \(x) 修成 \\(x)（合法转义 \\ / b f n r t u " 保留）
+        return re.sub(r'\\(?![\\/bfnrtu"])', r'\\\\', s)
+
+    decoder = json.JSONDecoder()
+    for cand in (_fix(text), text):
+        try:
+            obj, _ = decoder.raw_decode(cand.lstrip())
+            return obj
+        except Exception:
+            continue
+    # 兜底：截取首个 { ... } 再试
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            obj, _ = decoder.raw_decode(_fix(m.group(0)))
+            return obj
+        except Exception:
+            pass
+    # 最后手段：strict=False 容忍控制字符
+    return json.loads(_fix(text), strict=False)
+
 
 def api_get(url: str, params: dict = None, retries: int = 3, silent: bool = False) -> Optional[dict]:
     if params is None:
@@ -67,25 +98,8 @@ def api_get(url: str, params: dict = None, retries: int = 3, silent: bool = Fals
                 text = re.sub(r"^_Callback\s*\(\s*", "", text)
                 text = re.sub(r"\s*\)\s*$", "", text)
 
-            try:
-                # 用 raw_decode 解析第一个 JSON 对象（容错 Extra data 和非法转义）
-                decoder = json.JSONDecoder()
-                data, _ = decoder.raw_decode(text)
-            except Exception:
-                try:
-                    # 修复非法反斜杠转义后重试
-                    fixed = re.sub(r'\\(?![\\/bfnrtu"])', r'\\\\', text)
-                    data, _ = decoder.raw_decode(fixed)
-                except Exception:
-                    # 仍失败：尝试只取第一个 { } 之间的内容
-                    m = re.search(r'\{.*\}', text, re.DOTALL)
-                    if m:
-                        try:
-                            data, _ = decoder.raw_decode(m.group(0))
-                        except Exception:
-                            raise
-                    else:
-                        raise
+            # 解析 JSON（兼容非法转义 / Extra data / 回调包装）
+            data = _parse_qzone_json(text)
             code = data.get("code", -1)
             if code != 0:
                 msg = data.get("message", "")
@@ -376,37 +390,57 @@ def list_albums(uin: str, host_uin: str, g_tk: int, qzt: str) -> list:
 
 def list_photos(uin: str, host_uin: str, album_id: str, g_tk: int, qzt: str, silent: bool = False) -> List[dict]:
     """
-    通过 fcg_list_photo_v2 获取相册所有照片。
-    关键：参数必须是 albumid（全小写），不是 topicId！
+    通过 cgi_list_photo 获取相册所有照片。
+
+    ⚠ v2.3.3 修复（大相册 2000 截断）：
+      旧实现用 fcg_list_photo_v2，该接口会忽略所有分页参数、单次硬限返回约 2000 条，
+      导致 2000 张以上的相册永远取不全。
+      现改用 cgi_list_photo：
+        - 参数：topicId（相册 ID）+ pageStart（起始偏移）+ pageNum（每页张数，上限 500）；
+        - 响应：data.photoList（照片数组）+ data.totalInAlbum（相册总数）；
+        - 逐段推进 pageStart，直到取满 totalInAlbum。
     silent=True 时不打印进度（用于后台扫描）
     """
-    photos = []
-    page = 1
-    page_size = 100
+    photos: List[dict] = []
+    seen = set()
+    offset = 0
+    page_size = 500
+    total = 0
+    MAX_PAGES = 1000  # 安全上限，异常时也不会死循环
 
-    while True:
-        data = api_get(f"{PROXY}/fcg_list_photo_v2", {
+    for _ in range(MAX_PAGES):
+        data = api_get(f"{PROXY}/cgi_list_photo", {
             "uin": uin, "hostUin": host_uin,
-            "albumid": album_id,
-            "pageNum": page, "pageSize": page_size,
+            "topicId": album_id,        # cgi_list_photo 用 topicId
+            "pageStart": offset,        # 起始偏移量（关键分页参数）
+            "pageNum": page_size,       # 本页张数（上限 500）
             "format": "json", "g_tk": g_tk, "qzonetoken": qzt,
         })
         if data is None:
-            if not silent:
+            if not silent and not photos:
                 print(f"  ⚠ 无法获取文件列表（相册可能未公开或需登录查看）")
             break
 
-        pics = data.get("data", {}).get("pic", [])
+        d = data.get("data", {}) or {}
+        pics = d.get("photoList") or d.get("pic") or []
         if not pics:
             break
 
+        added = 0
         for p in pics:
-            raw_url = (p.get("origin_url") or p.get("raw") or
+            key = p.get("lloc") or p.get("url") or p.get("id") or p.get("name") or ""
+            if key:
+                if key in seen:
+                    continue
+                seen.add(key)
+            added += 1
+
+            raw_url = (p.get("origin_url") or p.get("raw") or p.get("origin") or
                        p.get("url") or p.get("picUrl") or "")
             if raw_url and not raw_url.startswith("http"):
                 raw_url = "https://" + raw_url
 
-            entry = {
+            photos.append({
                 "id": p.get("id") or p.get("lloc", "")[:16],
                 "name": p.get("name", ""),
                 "url": raw_url,
@@ -418,19 +452,31 @@ def list_photos(uin: str, host_uin: str, album_id: str, g_tk: int, qzt: str, sil
                 "vid": p.get("vid", ""),
                 "batchId": p.get("batchId", ""),
                 "lloc": p.get("lloc", ""),
-            }
-            photos.append(entry)
+            })
 
-        total = data.get("data", {}).get("pageNum", 0)
-        page += 1
+        # 相册总数（兼容不同字段名）
+        t = d.get("totalInAlbum") or d.get("picsTotal") or d.get("total")
+        try:
+            if t:
+                total = int(t)
+        except (TypeError, ValueError):
+            pass
+
         if not silent:
             print(f"    → {len(photos)}张", end="\r")
         time.sleep(REQUEST_DELAY)
 
+        # 本页不足请求量 → 已到末尾
         if len(pics) < page_size:
             break
-        if total > 0 and len(photos) >= total:
+        # 已取满相册总数
+        if total and len(photos) >= total:
             break
+        # 本页无新增 → 停止，避免死循环
+        if added == 0:
+            break
+
+        offset += len(pics)
 
     return photos
 
